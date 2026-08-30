@@ -3,14 +3,14 @@ Forge —— 自研编程智能体
 Git 仓库地址：https://github.com/zengjuju/AI-Agent
 
 一、项目简介
-Forge 是运行在本地终端的编程智能体，通过与大语言模型交互，能自主读写文件、执行命令，完成编程任务。核心逻辑（对话历史与上下文管理、工具定义与本地执行、模型输出解析、循环终止条件、错误处理）全部自研，未使用任何 agent 框架/SDK，也不依赖服务端托管执行。
+Forge 是运行在本地终端的编程智能体，通过与大语言模型交互，能自主读写文件、执行命令，完成编程任务。核心逻辑:对话历史与上下文管理、工具定义与本地执行、模型输出解析、循环终止条件、错误处理，未使用任何 agent 框架/SDK，也不依赖服务端托管执行。
 
 二、技术栈
 TypeScript + Node.js 22；OpenAI 兼容 Chat Completions 原生 tool calling；内置 Mock Provider 支持离线演示。
 
 三、如何运行
 1. 安装依赖：npm install
-2. 配置凭据（仅环境变量，切勿写入任何文件）：
+2. 配置凭据：
    $env:FORGE_API_KEY='你的key'
    $env:FORGE_API_BASE='https://api.deepseek.com/v1'
    $env:FORGE_MODEL='deepseek-chat'

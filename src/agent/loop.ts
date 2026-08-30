@@ -1,6 +1,6 @@
 import { ChatMessage, ChatProvider, ChatResponse, ToolCall } from '../llm/types.js';
 import { ToolRegistry } from '../tools/registry.js';
-import { buildSystemMessage, trimMessages } from './context.js';
+import { buildSystemMessage, compactContext } from './context.js';
 
 export interface AgentLoopDeps {
   provider: ChatProvider;
@@ -10,11 +10,14 @@ export interface AgentLoopDeps {
   maxRounds?: number;
   maxRetries?: number;
   commandTimeoutMs?: number;
-  contextMessageLimit?: number;
+  contextTokenBudget?: number; // 模型上下文窗口 token 上限（默认 128000）
   signal?: AbortSignal;
+  /** 长期偏好事实（已格式化的 prompt 文本），会拼进 system message */
+  longTermFacts?: string;
   onToolCall?: (call: ToolCall) => void;
   onAssistantMessage?: (message: ChatMessage) => void;
   onToolResult?: (call: ToolCall, result: { ok: boolean; output: string; error?: string }) => void;
+  onCompact?: (info: { didCompact: boolean; savedTokens: number; summary?: string }) => void;
 }
 
 export interface AgentResult {
@@ -31,12 +34,18 @@ export async function runAgentTask(
   history?: ChatMessage[],
 ): Promise<AgentResult> {
   const maxRounds = deps.maxRounds ?? 12;
-  const messages: ChatMessage[] =
+  // 每次都用最新 system message（保证长期事实是最新的），
+  // 即使 history 里有旧 system，也替换掉（消息里的 system role 只允许一个存在于入模序列）。
+  const freshSystem = buildSystemMessage(deps.cwd, deps.longTermFacts);
+  const historyWithoutOldSystem =
     history && history.length > 0
-      ? history[0].role === 'system'
-        ? [...history, { role: 'user', content: userInput }]
-        : [buildSystemMessage(deps.cwd), ...history, { role: 'user', content: userInput }]
-      : [buildSystemMessage(deps.cwd), { role: 'user', content: userInput }];
+      ? history.filter((m) => m.role !== 'system')
+      : [];
+  const messages: ChatMessage[] = [
+    freshSystem,
+    ...historyWithoutOldSystem,
+    { role: 'user', content: userInput },
+  ];
 
   for (let round = 0; round < maxRounds; round++) {
     const attempt = await chatWithRetry(deps, messages);
@@ -95,7 +104,15 @@ async function chatWithRetry(deps: AgentLoopDeps, messages: ChatMessage[]): Prom
       return { ok: false, error: '任务已被用户中止' };
     }
     try {
-      const trimmed = trimMessages(messages, deps.contextMessageLimit ?? 50);
+      // 使用新的分层压缩（含 LLM CHECKPOINT）
+      const { messages: trimmed, didCompact, summary, tokenStats } = await compactContext(
+        messages,
+        deps.provider,
+        deps.contextTokenBudget ?? 128_000,
+      );
+      if (didCompact) {
+        deps.onCompact?.({ didCompact, savedTokens: tokenStats.saved, summary });
+      }
       const response = await deps.provider.chat(
         {
           model: deps.provider.model,

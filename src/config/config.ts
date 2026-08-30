@@ -82,6 +82,22 @@ export function parseCliArgs(argv: string[]): CliArgs {
   return args;
 }
 
+/**
+ * 读取某个键：优先 FORGE_ 前缀 -> 兼容 PI_ 前缀 -> 兼容 DEEPSEEK_ 前缀
+ * （对应用户历史要求：通过 PI_API_KEY / PI_API_BASE / PI_MODEL 配置真实模型通道）
+ */
+function envPick(forgeKey: string, piKey: string, deepseekKey?: string): string | undefined {
+  const v = process.env[forgeKey];
+  if (typeof v === 'string' && v.length > 0) return v;
+  const pv = process.env[piKey];
+  if (typeof pv === 'string' && pv.length > 0) return pv;
+  if (deepseekKey) {
+    const dv = process.env[deepseekKey];
+    if (typeof dv === 'string' && dv.length > 0) return dv;
+  }
+  return undefined;
+}
+
 export async function loadConfig(args: CliArgs): Promise<AppConfig> {
   const startCwd = path.resolve(args.cwd ?? process.env.FORGE_CWD ?? process.cwd());
   let fileConfig: Partial<AppConfig> = {};
@@ -92,22 +108,31 @@ export async function loadConfig(args: CliArgs): Promise<AppConfig> {
     // optional config file
   }
 
+  const envProvider = process.env.FORGE_PROVIDER;
+  const envApiKey = envPick('FORGE_API_KEY', 'PI_API_KEY', 'DEEPSEEK_API_KEY');
+  const envModel = envPick('FORGE_MODEL', 'PI_MODEL', 'DEEPSEEK_MODEL');
+  const envApiBase = envPick('FORGE_API_BASE', 'PI_API_BASE', 'DEEPSEEK_API_BASE');
+
   const providerRaw =
-    args.provider ?? process.env.FORGE_PROVIDER ?? fileConfig.provider ?? (process.env.FORGE_API_KEY ? 'openai-compatible' : 'mock');
+    args.provider ?? envProvider ?? fileConfig.provider ?? (envApiKey ? 'openai-compatible' : 'mock');
   const provider: ProviderName = providerRaw === 'openai-compatible' ? 'openai-compatible' : 'mock';
 
   const cwd = path.resolve(
     args.cwd ?? process.env.FORGE_CWD ?? fileConfig.cwd ?? startCwd,
   );
-  const apiKey = process.env.FORGE_API_KEY ?? fileConfig.apiKey;
+  const apiKey = envApiKey ?? fileConfig.apiKey;
   if (provider === 'openai-compatible' && !apiKey) {
-    throw new Error('FORGE_API_KEY 未设置；使用 openai-compatible Provider 必须通过环境变量提供 API Key。');
+    throw new Error(
+      '未检测到可用的 API Key；使用 openai-compatible Provider 请通过环境变量 FORGE_API_KEY（或兼容别名 PI_API_KEY / DEEPSEEK_API_KEY）提供。',
+    );
   }
 
+  const modelDefault = envModel && !fileConfig.model ? envModel : 'gpt-4.1-mini';
+  const baseDefault = envApiBase && !fileConfig.apiBase ? envApiBase : 'https://api.openai.com/v1';
   const config: AppConfig = {
     provider,
-    model: args.model ?? process.env.FORGE_MODEL ?? fileConfig.model ?? 'gpt-4.1-mini',
-    apiBase: args.apiBase ?? process.env.FORGE_API_BASE ?? fileConfig.apiBase ?? 'https://api.openai.com/v1',
+    model: args.model ?? envModel ?? fileConfig.model ?? modelDefault,
+    apiBase: args.apiBase ?? envApiBase ?? fileConfig.apiBase ?? baseDefault,
     apiKey,
     cwd,
     maxRounds: toPositiveInt(args.maxRounds ?? process.env.FORGE_MAX_ROUNDS ?? fileConfig.maxRounds, 12),

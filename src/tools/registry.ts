@@ -1,9 +1,10 @@
 import { ToolDefinition } from '../llm/types.js';
 import { listDirTool, readFileTool, runCommandTool, writeFileTool } from './files.js';
+import { fetchUrlTool, searchNewsTool } from './web.js';
 import { Tool, ToolExecutionContext, ToolResult } from './types.js';
 import { validateArgs } from './validate.js';
 
-export const defaultTools: Tool[] = [listDirTool, readFileTool, writeFileTool, runCommandTool];
+export const defaultTools: Tool[] = [listDirTool, readFileTool, writeFileTool, runCommandTool, fetchUrlTool, searchNewsTool];
 
 export class ToolRegistry {
   private readonly tools = new Map<string, Tool>();
