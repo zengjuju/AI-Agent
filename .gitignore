@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.forge/
+.pi/
+docs/
+推免考核题目学生版.pdf
+*.log
+.env
+.env.*
+!.env.example
+*.local
+.DS_Store
+Thumbs.db
