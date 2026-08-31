@@ -1037,6 +1037,215 @@ body {
   }
   .sidebar.open { transform: translateX(0); }
 }
+
+/* ============ Memory card: 左下角记忆偏好（主流 AI 风，克制、去 AI 味） ============ */
+.memory-card {
+  margin-top: 8px;
+  padding: 12px 12px 14px;
+  border-top: 1px solid var(--divider, rgba(15, 23, 42, 0.07));
+  background: transparent;
+}
+.memory-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.memory-card-icon {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--bg-elev, #f3f4f6);
+  color: var(--text-mute, #6b7280);
+}
+.memory-card-titles { line-height: 1.25; min-width: 0; }
+.memory-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #1f2937);
+  letter-spacing: 0.01em;
+}
+.memory-card-sub {
+  font-size: 11px;
+  color: var(--text-mute, #6b7280);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Empty state */
+.memory-empty {
+  padding: 6px 2px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-mute, #6b7280);
+  text-align: left;
+}
+
+/* Memory item list */
+.memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+  max-height: 160px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.memory-list::-webkit-scrollbar { width: 6px; }
+.memory-list::-webkit-scrollbar-thumb { background: rgba(15,23,42,.14); border-radius: 3px; }
+
+.memory-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 8px 7px 8px;
+  border-radius: 8px;
+  background: var(--bg-elev, #f7f7f8);
+  transition: background-color .15s ease;
+}
+.memory-item:hover { background: var(--bg-hover, #eef0f3); }
+.memory-item-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-top: 6px;
+  margin-left: 2px;
+  border-radius: 50%;
+  background: var(--accent, #4f46e5);
+  opacity: 0.55;
+}
+.memory-item-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text, #1f2937);
+  word-break: break-word;
+}
+.memory-item-del {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: var(--text-mute, #9ca3af);
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s ease, color .15s ease, background-color .15s ease;
+}
+.memory-item:hover .memory-item-del { opacity: 1; }
+.memory-item-del:hover { color: #ef4444; background: rgba(239,68,68,.09); }
+
+/* Capsule memory input: 合并式输入容器（主流） */
+.memory-input-wrap {
+  display: flex;
+  align-items: stretch;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--bg-elev, #f3f4f6);
+  border: 1px solid transparent;
+  overflow: hidden;
+  transition: border-color .15s ease, background-color .15s ease, box-shadow .15s ease;
+}
+.memory-input-wrap:focus-within {
+  background: #fff;
+  border-color: rgba(79, 70, 229, 0.35);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+}
+.memory-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 10px;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: 12.5px;
+  line-height: 36px;
+  color: var(--text, #1f2937);
+}
+.memory-input::placeholder {
+  color: var(--text-mute, #9ca3af);
+}
+.memory-add-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 11px 0 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-mute, #6b7280);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  border-left: 1px solid rgba(15,23,42,.08);
+  transition: color .15s ease, background-color .15s ease;
+  white-space: nowrap;
+}
+.memory-add-btn:hover {
+  color: var(--accent, #4f46e5);
+  background: rgba(79, 70, 229, .06);
+}
+.memory-add-btn svg { display: block; }
+
+/* 兼容：隐藏旧样式占位（旧 class 不再渲染） */
+.memory-add { display: none; }
+.btn-mini { display: none; }
+.sidebar-section-label + .memory-card + .memory-add { display: none; }
+
+@media (prefers-color-scheme: dark) {
+  .memory-card { border-top-color: rgba(255,255,255,.08); }
+  .memory-card-icon { background: rgba(255,255,255,.06); color: #a1a1aa; }
+  .memory-item { background: rgba(255,255,255,.05); }
+  .memory-item:hover { background: rgba(255,255,255,.08); }
+  .memory-input-wrap { background: rgba(255,255,255,.05); }
+  .memory-input-wrap:focus-within { background: rgba(255,255,255,.04); border-color: rgba(129,140,248,.45); box-shadow: 0 0 0 3px rgba(129,140,248,.18); }
+  .memory-add-btn { border-left-color: rgba(255,255,255,.08); }
+  .memory-add-btn:hover { color: #a5b4fc; background: rgba(129,140,248,.12); }
+}
+
+/* ============ markdown 渲染样式（Agent 回复正文） ============ */
+.md-body { font-size: 14.5px; line-height: 1.65; color: var(--text, #1f2937); word-break: break-word; }
+.md-body p.md-p { margin: 0 0 8px; }
+.md-body p.md-p:last-child { margin-bottom: 0; }
+.md-body h1.md-h, .md-body h2.md-h, .md-body h3.md-h {
+  font-weight: 600; line-height: 1.35; margin: 14px 0 8px; color: var(--text, #1f2937);
+}
+.md-body h1.md-h { font-size: 18px; }
+.md-body h2.md-h { font-size: 16px; }
+.md-body h3.md-h { font-size: 15px; }
+.md-body h1.md-h:first-child, .md-body h2.md-h:first-child, .md-body h3.md-h:first-child { margin-top: 0; }
+.md-body ul.md-ul, .md-body ol.md-ol { margin: 6px 0 10px; padding-left: 22px; }
+.md-body li.md-li, .md-body li.md-ol-li { margin-bottom: 3px; line-height: 1.55; }
+.md-body li.md-li { list-style: disc; }
+.md-body li.md-ol-li { list-style: decimal; }
+.md-body hr.md-hr { border: none; border-top: 1px solid var(--divider, rgba(15,23,42,.1)); margin: 12px 0; }
+.md-body strong { font-weight: 600; }
+.md-body pre.md-code {
+  background: var(--bg-elev, #f7f7f8); border: 1px solid var(--divider, rgba(15,23,42,.08));
+  border-radius: 8px; padding: 12px 14px; margin: 8px 0; overflow-x: auto; font-size: 13px; line-height: 1.5;
+}
+.md-body pre.md-code code { font-family: 'SF Mono', 'Cascadia Code', Consolas, 'Liberation Mono', monospace; white-space: pre; }
+.md-body code.md-code-inline {
+  background: var(--bg-elev, #f3f4f6); padding: 1px 5px; border-radius: 4px; font-size: 13px;
+  font-family: 'SF Mono', 'Cascadia Code', Consolas, 'Liberation Mono', monospace; color: var(--text, #1f2937);
+}
+@media (prefers-color-scheme: dark) {
+  .md-body pre.md-code { background: rgba(0,0,0,.25); border-color: rgba(255,255,255,.08); }
+  .md-body code.md-code-inline { background: rgba(255,255,255,.08); }
+}
 </style>
 </head>
 <body>
@@ -1068,13 +1277,35 @@ body {
     <div style="padding: 20px; text-align: center; color: var(--text-mute); font-size: 12px;">(无历史会话)</div>
   </div>
 
-  <div class="sidebar-section-label"><span>用户偏好（长期记忆）</span></div>
-  <div class="memory-list" id="memoryList">
-    <div style="padding: 8px 0; text-align: center; color: var(--text-mute); font-size: 12px;">(还没有偏好记忆)</div>
-  </div>
-  <div class="memory-add">
-    <input type="text" id="memoryInput" placeholder="添加偏好：例如 习惯用中文回答…" />
-    <button class="btn-mini" id="memoryAddBtn">添加</button>
+  <!-- ===== Sidebar Memory: 记忆偏好（主流 AI 设计，克制、不抢主 CTA） ===== -->
+  <div class="memory-card">
+    <div class="memory-card-head">
+      <svg class="memory-card-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path>
+        <circle cx="12" cy="7" r="4"></circle>
+        <path d="M5 7h2"></path>
+        <path d="M17 7h2"></path>
+        <path d="M12 3v1"></path>
+      </svg>
+      <div class="memory-card-titles">
+        <div class="memory-card-title">记忆偏好</div>
+        <div class="memory-card-sub">自动注入每轮 system prompt</div>
+      </div>
+    </div>
+
+    <div class="memory-list" id="memoryList">
+      <div class="memory-empty">暂无偏好，添加后会用于每轮对话</div>
+    </div>
+
+    <div class="memory-input-wrap">
+      <input type="text" id="memoryInput" class="memory-input" placeholder="添加偏好（例：中文回答、不写分号、TS 严格模式）" />
+      <button class="memory-add-btn" id="memoryAddBtn" title="保存偏好">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14M5 12h14"></path>
+        </svg>
+        <span>保存</span>
+      </button>
+    </div>
   </div>
 </aside>
 
@@ -1161,6 +1392,56 @@ function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, function(c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c];
   });
+}
+
+/* 轻量 markdown to HTML（无外部依赖） */
+function renderMd(md) {
+  if (!md) return '';
+  var s = String(md);
+  var blocks = [];
+  // 1. code blocks: triple backtick ... triple backtick -> placeholder
+  s = s.replace(/\x60\x60\x60(\w*)\n?([\s\S]*?)\x60\x60\x60/g, function(_, lang, code) {
+    var i = blocks.length;
+    blocks.push('<pre class="md-code"><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>');
+    return '__CB' + i + '__';
+  });
+  // 2. escape HTML
+  s = esc(s);
+  // 3. inline code
+  s = s.replace(/\x60([^\n\x60]+)\x60/g, '<code class="md-code-inline">$1</code>');
+  // 4. bold
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  // 5. line-by-line block elements (placeholders are single-line, safe to split)
+  var lines = s.split('\n');
+  var out = [];
+  var inUl = false, inOl = false;
+  var para = [];
+  function flushPara() {
+    if (para.length) { out.push('<p class="md-p">' + para.join('<br>') + '</p>'); para = []; }
+  }
+  function closeLists() { if (inUl) { out.push('</ul>'); inUl = false; } if (inOl) { out.push('</ol>'); inOl = false; } }
+  for (var i = 0; i < lines.length; i++) {
+    var t = lines[i].trim();
+    if (!t) { closeLists(); flushPara(); continue; }
+    // placeholder (restored later as whole block)
+    var pm = t.match(/^__CB(\d+)__$/);
+    if (pm) { closeLists(); flushPara(); out.push('__CB' + pm[1] + '__'); continue; }
+    if (/^<h[1-3] /.test(t)) { closeLists(); flushPara(); out.push(t); continue; }
+    if (t === '<hr class="md-hr">') { closeLists(); flushPara(); out.push(t); continue; }
+    var hm = t.match(/^(#{1,3})\s+(.+)/);
+    if (hm) { closeLists(); flushPara(); var lvl = hm[1].length; out.push('<h' + lvl + ' class="md-h">' + hm[2] + '</h' + lvl + '>'); continue; }
+    if (/^(-{3}|\*{3})$/.test(t)) { closeLists(); flushPara(); out.push('<hr class="md-hr">'); continue; }
+    var ul = t.match(/^[\-\*]\s+(.+)/);
+    if (ul) { flushPara(); if (inOl) { out.push('</ol>'); inOl = false; } if (!inUl) { out.push('<ul class="md-ul">'); inUl = true; } out.push('<li class="md-li">' + ul[1] + '</li>'); continue; }
+    var ol = t.match(/^\d+\.\s+(.+)/);
+    if (ol) { flushPara(); if (inUl) { out.push('</ul>'); inUl = false; } if (!inOl) { out.push('<ol class="md-ol">'); inOl = true; } out.push('<li class="md-ol-li">' + ol[1] + '</li>'); continue; }
+    para.push(t);
+  }
+  closeLists(); flushPara();
+  // 6. restore code blocks LAST (after all block-level wrapping)
+  var result = out.join('\n');
+  result = result.replace(/__CB(\d+)__/g, function(_, i) { return blocks[+i]; });
+  return result;
 }
 function showEmpty() { emptyState.style.display = chat.children.length === 1 ? 'block' : 'none'; }
 function scrollBottom() { chat.scrollTop = chat.scrollHeight; }
@@ -1269,13 +1550,14 @@ async function loadMemory() {
     var r = await fetch('/api/memory');
     var d = await r.json();
     if (!d.facts || d.facts.length === 0) {
-      memoryList.innerHTML = '<div style="padding:8px 0;text-align:center;color:var(--text-mute);font-size:12px">(还没有偏好记忆)</div>';
+      memoryList.innerHTML = '<div class="memory-empty">暂无偏好，添加后会用于每轮对话</div>';
       return;
     }
     memoryList.innerHTML = d.facts.map(function(f) {
-      return '<div class="memory-item">' +
-        '<div class="memory-item-text">' + esc('#' + f.id + ' ' + f.fact) + '</div>' +
-        '<button class="memory-item-del" data-id="' + f.id + '" title="删除">×</button>' +
+      return '<div class="memory-item" title="' + esc('偏好 #' + f.id + '：' + f.fact) + '">' +
+        '<span class="memory-item-dot" aria-hidden="true"></span>' +
+        '<div class="memory-item-text">' + esc(f.fact) + '</div>' +
+        '<button class="memory-item-del" data-id="' + f.id + '" title="移除该偏好" aria-label="移除偏好">×</button>' +
       '</div>';
     }).join('');
     memoryList.querySelectorAll('.memory-item-del').forEach(function(btn) {
@@ -1529,10 +1811,8 @@ function render(ev) {
         msg.contentEl.appendChild(meta);
 
         var answer = document.createElement('div');
-        answer.style.whiteSpace = 'pre-wrap';
-        answer.style.lineHeight = '1.6';
-        answer.style.fontSize = '14.5px';
-        answer.textContent = ev.answer || '(无内容)';
+        answer.className = 'md-body';
+        answer.innerHTML = renderMd(ev.answer || '(无内容)');
         msg.contentEl.appendChild(answer);
 
         var details = buildProcessDetails(currentRun.steps, currentRun.toolCount);
