@@ -5,6 +5,8 @@ import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { runAgentTask } from '../agent/loop.js';
+import { Orchestrator } from '../agent/orchestrator.js';
+import { ROLES } from '../agent/roles.js';
 import { AppConfig, loadConfig, parseCliArgs } from '../config/config.js';
 import { demoSteps, MockProvider, RuleMockProvider } from '../llm/mock.js';
 import { OpenAICompatibleProvider } from '../llm/openaiCompatible.js';
@@ -354,7 +356,16 @@ async function handleHttpRequest(
       cwd: config.cwd, provider: provider.name, model: provider.model, eventCount: 0,
     };
     active.set({ id, history, meta });
-    jsonRes(res, 200, { ok: true, id, messageCount: history.length, summary: store.autoSummary(id) });
+    // 返回可渲染的消息（过滤掉 system 角色，保留 user/assistant/tool）
+    const renderableMsgs = history
+      .filter((m: ChatMessage) => m.role !== 'system')
+      .map((m: ChatMessage) => ({
+        role: m.role,
+        content: m.content,
+        toolCalls: m.tool_calls,
+        toolCallId: m.tool_call_id,
+      }));
+    jsonRes(res, 200, { ok: true, id, messageCount: history.length, summary: store.autoSummary(id), messages: renderableMsgs });
     return;
   }
   if (method === 'POST' && url.pathname.startsWith('/api/sessions/') && url.pathname.endsWith('/fork')) {
@@ -417,6 +428,38 @@ async function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
 function jsonRes(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
+}
+
+/* ================================================================
+ * 复杂度判断：决定走多 Agent 还是单 Agent
+ * ================================================================ */
+function isComplexRequest(input: string): boolean {
+  const text = input.trim();
+
+  // @multi 前缀强制多 Agent
+  if (text.startsWith('@multi ')) return true;
+
+  // 太短的请求走单 Agent
+  if (text.length < 30) return false;
+
+  // 多任务连接词
+  const multiTaskPatterns = [
+    /并/, /然后/, /接着/, /同时/, /以及/, /并且/, /之后/,
+    /先.*再/, /第.*步/, /分.*步/,
+  ];
+
+  // 复杂工程动词
+  const complexVerbs = [
+    /重构/, /搭建/, /实现一个/, /开发一个/, /创建一个/,
+    /设计一个/, /完成一个/, /做一个/,
+    /整体/, /全栈/, /端到端/,
+  ];
+
+  const hasMulti = multiTaskPatterns.some((p) => p.test(text));
+  const hasComplex = complexVerbs.some((p) => p.test(text));
+
+  // 需要同时满足：足够长 + 有多任务信号 或 复杂工程信号
+  return (hasMulti || hasComplex) && text.length >= 30;
 }
 
 /* ================================================================
@@ -488,75 +531,155 @@ async function serveTask(
   store.eventLog.append('user_message', { content: taskInput });
 
   try {
-    const result = await runAgentTask(
-      {
+    const useOrchestrator = isComplexRequest(taskInput);
+
+    if (useOrchestrator) {
+      // ====== 多 Agent 路径 ======
+      writeEvent({ type: 'orchestrator_mode', message: '检测到复杂任务，启动多 Agent 协作' });
+
+      const orchestrator = new Orchestrator({
         provider,
         tools,
         cwd: config.cwd,
-        maxRounds: config.maxRounds,
+        longTermFacts: factStore.formatForPrompt(),
         maxRetries: config.maxRetries,
         commandTimeoutMs: config.commandTimeoutMs,
-        longTermFacts: factStore.formatForPrompt(),
+        contextTokenBudget: 128_000,
         approve: async () => true,
-        onAssistantMessage: (message) => {
-          writeEvent({
-            type: 'assistant',
-            content: message.content,
-            toolCalls: (message.tool_calls ?? []).map((call) => ({
-              name: call.function.name,
-              arguments: call.function.arguments,
-            })),
-          });
-        },
-        onToolCall: (call) =>
-          writeEvent({ type: 'tool_call', name: call.function.name, arguments: call.function.arguments }),
-        onToolResult: (call, toolResult) =>
-          writeEvent({
-            type: 'tool_result',
-            name: call.function.name,
-            ok: toolResult.ok,
-            output: toolResult.output,
-            error: toolResult.error,
-          }),
-        onCompact: (info) => {
-          writeEvent({ type: 'compact', ...info });
-          if (info.summary) store.eventLog.append('checkpoint', { summary: info.summary, savedTokens: info.savedTokens });
-        },
-      },
-      taskInput,
-      now.history.length > 0 ? now.history : undefined,
-    );
+      });
 
-    // 把 assistant + tool 结果写进事件日志
-    for (const m of result.messages) {
-      if (m.role === 'assistant') {
-        store.eventLog.append('assistant_message', {
-          content: m.content ?? '',
-          tool_calls: (m.tool_calls ?? []).map((tc) => ({ id: tc.id, name: tc.function.name, arguments: tc.function.arguments })),
+      const orchResult = await orchestrator.run(
+        taskInput,
+        now.history.length > 0 ? now.history : [],
+        (ev) => writeEvent(ev),
+      );
+
+      // 如果 Orchestrator 返回空（单任务回退），走单 Agent
+      if (orchResult.answer) {
+        const orchMessages: ChatMessage[] = [
+          { role: 'user', content: taskInput },
+          { role: 'assistant', content: orchResult.answer },
+        ];
+
+        store.eventLog.append('assistant_message', { content: orchResult.answer, tool_calls: [] });
+
+        now.history.length = 0;
+        now.history.push(...orchMessages);
+        now.meta.lastAnswer = orchResult.answer;
+        now.meta.updatedAt = new Date().toISOString();
+        now.meta.eventCount = (now.meta.eventCount ?? 0) + 10;
+        store.saveMeta(now.meta);
+
+        const elapsedMs = Date.now() - taskStartMs;
+        writeEvent({
+          type: 'done',
+          status: 'completed',
+          answer: orchResult.answer,
+          rounds: orchResult.rounds,
+          error: undefined,
+          elapsedMs,
+          tokenEstimate: 0,
         });
-      } else if (m.role === 'tool') {
-        store.eventLog.append('tool_result', { tool_call_id: m.tool_call_id, output: m.content });
+      } else {
+        // 回退到单 Agent
+        const fallbackPrevLen = now.history.length;
+        const result = await runAgentTask(
+          {
+            provider, tools, cwd: config.cwd,
+            maxRounds: config.maxRounds, maxRetries: config.maxRetries,
+            commandTimeoutMs: config.commandTimeoutMs,
+            longTermFacts: factStore.formatForPrompt(),
+            approve: async () => true,
+            onAssistantMessage: (m) => writeEvent({ type: 'assistant', content: m.content, toolCalls: (m.tool_calls ?? []).map((c) => ({ name: c.function.name, arguments: c.function.arguments })) }),
+            onToolCall: (c) => writeEvent({ type: 'tool_call', name: c.function.name, arguments: c.function.arguments }),
+            onToolResult: (c, r) => writeEvent({ type: 'tool_result', name: c.function.name, ok: r.ok, output: r.output, error: r.error }),
+            onCompact: (info) => { writeEvent({ type: 'compact', ...info }); if (info.summary) store.eventLog.append('checkpoint', { summary: info.summary, savedTokens: info.savedTokens }); },
+          },
+          taskInput,
+          now.history.length > 0 ? now.history : undefined,
+        );
+
+        for (const m of result.messages.slice(fallbackPrevLen + 1)) {
+          if (m.role === 'assistant') store.eventLog.append('assistant_message', { content: m.content ?? '', tool_calls: (m.tool_calls ?? []).map((tc) => ({ id: tc.id, name: tc.function.name, arguments: tc.function.arguments })) });
+          else if (m.role === 'tool') store.eventLog.append('tool_result', { tool_call_id: m.tool_call_id, output: m.content });
+        }
+        now.history.length = 0; now.history.push(...result.messages);
+        now.meta.lastAnswer = result.answer; now.meta.updatedAt = new Date().toISOString();
+        now.meta.eventCount = (now.meta.eventCount ?? 0) + 10; store.saveMeta(now.meta);
+        writeEvent({ type: 'done', status: result.status, answer: result.answer, rounds: result.rounds, error: result.error, elapsedMs: Date.now() - taskStartMs, tokenEstimate: estimateTotalTokens(result.messages) });
       }
+    } else {
+      // ====== 单 Agent 路径（原有逻辑） ======
+      const prevLen = now.history.length;
+      const result = await runAgentTask(
+        {
+          provider,
+          tools,
+          cwd: config.cwd,
+          maxRounds: config.maxRounds,
+          maxRetries: config.maxRetries,
+          commandTimeoutMs: config.commandTimeoutMs,
+          longTermFacts: factStore.formatForPrompt(),
+          approve: async () => true,
+          onAssistantMessage: (message) => {
+            writeEvent({
+              type: 'assistant',
+              content: message.content,
+              toolCalls: (message.tool_calls ?? []).map((call) => ({
+                name: call.function.name,
+                arguments: call.function.arguments,
+              })),
+            });
+          },
+          onToolCall: (call) =>
+            writeEvent({ type: 'tool_call', name: call.function.name, arguments: call.function.arguments }),
+          onToolResult: (call, toolResult) =>
+            writeEvent({
+              type: 'tool_result',
+              name: call.function.name,
+              ok: toolResult.ok,
+              output: toolResult.output,
+              error: toolResult.error,
+            }),
+          onCompact: (info) => {
+            writeEvent({ type: 'compact', ...info });
+            if (info.summary) store.eventLog.append('checkpoint', { summary: info.summary, savedTokens: info.savedTokens });
+          },
+        },
+        taskInput,
+        now.history.length > 0 ? now.history : undefined,
+      );
+
+      // 只写入新增的 assistant/tool 消息（跳过历史 + user 消息）
+      for (const m of result.messages.slice(prevLen + 1)) {
+        if (m.role === 'assistant') {
+          store.eventLog.append('assistant_message', {
+            content: m.content ?? '',
+            tool_calls: (m.tool_calls ?? []).map((tc) => ({ id: tc.id, name: tc.function.name, arguments: tc.function.arguments })),
+          });
+        } else if (m.role === 'tool') {
+          store.eventLog.append('tool_result', { tool_call_id: m.tool_call_id, output: m.content });
+        }
+      }
+
+      now.history.length = 0;
+      now.history.push(...result.messages);
+      now.meta.lastAnswer = result.answer;
+      now.meta.updatedAt = new Date().toISOString();
+      now.meta.eventCount = (now.meta.eventCount ?? 0) + 10;
+      store.saveMeta(now.meta);
+
+      const elapsedMs = Date.now() - taskStartMs;
+      writeEvent({
+        type: 'done',
+        status: result.status,
+        answer: result.answer,
+        rounds: result.rounds,
+        error: result.error,
+        elapsedMs,
+        tokenEstimate: estimateTotalTokens(result.messages),
+      });
     }
-
-    // 更新活跃会话的累积历史
-    now.history.length = 0;
-    now.history.push(...result.messages);
-    now.meta.lastAnswer = result.answer;
-    now.meta.updatedAt = new Date().toISOString();
-    now.meta.eventCount = (now.meta.eventCount ?? 0) + 10; // 近似值
-    store.saveMeta(now.meta);
-
-    const elapsedMs = Date.now() - taskStartMs;
-    writeEvent({
-      type: 'done',
-      status: result.status,
-      answer: result.answer,
-      rounds: result.rounds,
-      error: result.error,
-      elapsedMs,
-      tokenEstimate: estimateTotalTokens(result.messages),
-    });
   } catch (err) {
     writeEvent({ type: 'error', error: err instanceof Error ? err.message : String(err) });
   } finally {
@@ -1246,6 +1369,210 @@ body {
   .md-body pre.md-code { background: rgba(0,0,0,.25); border-color: rgba(255,255,255,.08); }
   .md-body code.md-code-inline { background: rgba(255,255,255,.08); }
 }
+
+/* === 多 Agent 协作 UI === */
+.orch-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; margin: 4px 0;
+  background: var(--accent-soft, rgba(79,110,247,0.10));
+  border-radius: 8px; font-size: 13px; color: var(--accent, #4f6ef7);
+}
+.orch-plan {
+  background: var(--bg-elev, #f7f7f8); border-radius: 10px; padding: 12px 14px;
+  margin: 4px 0; border-left: 3px solid var(--accent, #4f6ef7);
+}
+.orch-plan-title { font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 8px; }
+.orch-plan-list { list-style: none; padding: 0; }
+.orch-plan-item { padding: 4px 0; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+.orch-plan-id { font-weight: 600; color: var(--accent, #4f6ef7); min-width: 28px; }
+.orch-plan-role { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); }
+.orch-plan-title-text { flex: 1; }
+.orch-plan-dep { font-size: 11px; color: var(--text-mute); }
+
+/* 角色 avatar 圆形 */
+.role-avatar {
+  width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: #fff;
+}
+.role-P { background: #4f6ef7; }
+.role-C { background: #16a34a; }
+.role-R { background: #d97706; }
+.role-V { background: #dc2626; }
+.role-A { background: #7c3aed; }
+
+/* 多 Agent 消息气泡 */
+.agent-msg {
+  display: flex; gap: 10px; margin: 8px 0;
+  align-items: flex-start;
+}
+.agent-msg-content {
+  flex: 1; min-width: 0;
+}
+.agent-msg-header {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
+}
+.agent-msg-name { font-size: 13px; font-weight: 600; color: var(--text-dim); }
+.agent-msg-status { font-size: 11px; color: var(--text-mute); }
+.agent-msg-body {
+  background: var(--assistant-bubble, #f2f2f4);
+  border-radius: 12px; padding: 12px 16px; font-size: 14px; line-height: 1.6;
+  color: var(--assistant-bubble-text, #1a1a1f);
+}
+.agent-msg-body .md-body { font-size: 14px; }
+.agent-msg-meta {
+  font-size: 11px; color: var(--text-mute); margin-top: 4px;
+}
+
+/* 多 Agent subtask 过程折叠（原生 details） */
+details.process-details {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+details.process-details > summary {
+  list-style: none;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; cursor: pointer; user-select: none;
+  font-size: 12px; color: var(--text-dim);
+  transition: background 0.15s;
+}
+details.process-details > summary:hover { background: var(--bg-hover); }
+details.process-details > summary::-webkit-details-marker { display: none; }
+details.process-details > summary .sub-tool-count {
+  font-style: normal; color: var(--text-mute); margin-left: 2px;
+}
+details.process-details > summary .chevron {
+  font-size: 11px; color: var(--text-mute);
+  transition: transform 0.15s ease;
+}
+details.process-details[open] > summary .chevron { transform: rotate(90deg); }
+details.process-details .process-body {
+  border-top: 1px solid var(--border);
+  padding: 8px 10px 10px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+/* 过程 step（think + tool） */
+details.process-details .process-body .step {
+  display: flex; gap: 8px; padding: 6px 8px; border-radius: 8px;
+  background: var(--bg);
+  align-items: flex-start;
+}
+details.process-details .process-body .step .step-icon {
+  font-size: 13px; flex-shrink: 0; width: 20px; height: 20px;
+  border-radius: 4px; display: grid; place-items: center;
+  background: var(--bg-hover);
+}
+details.process-details .process-body .step.think .step-icon { background: rgba(79,110,247,0.10); }
+details.process-details .process-body .step.tool.ok .step-icon { background: rgba(22,163,74,0.10); }
+details.process-details .process-body .step.tool.fail .step-icon { background: rgba(220,38,38,0.10); }
+details.process-details .process-body .step .step-body {
+  flex: 1; min-width: 0; font-size: 13px; line-height: 1.55;
+}
+details.process-details .process-body .step .step-title {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 600; color: var(--text);
+}
+details.process-details .process-body .step .tool-name { color: var(--accent); }
+details.process-details .process-body .step .tool-status {
+  font-size: 11px; padding: 0 6px; border-radius: 4px;
+}
+details.process-details .process-body .step .tool-status.pending {
+  background: rgba(217,119,6,0.12); color: #d97706;
+}
+details.process-details .process-body .step .tool-status.ok {
+  background: rgba(22,163,74,0.12); color: #16a34a;
+}
+details.process-details .process-body .step .tool-status.fail {
+  background: rgba(220,38,38,0.12); color: #dc2626;
+}
+details.process-details .process-body .step pre {
+  margin: 6px 0 0; padding: 8px 10px;
+  background: var(--bg-alt); border-radius: 6px;
+  font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  overflow: auto; max-height: 220px;
+  font-family: 'SF Mono','Cascadia Code',Consolas,monospace;
+}
+details.process-details .process-body .step.tool-output {
+  margin: 6px 0 0; background: var(--bg-alt); border-radius: 6px;
+}
+details.process-details .process-body .step.tool-output > summary {
+  list-style: none;
+  padding: 4px 8px; font-size: 11px; color: var(--text-mute); cursor: pointer;
+}
+details.process-details .process-body .step.tool-output > summary::-webkit-details-marker { display: none; }
+details.process-details .process-body .step.tool-output > pre {
+  margin: 0; padding: 8px 10px; border-radius: 0 0 6px 6px;
+  background: var(--bg-alt);
+}
+details.tool-output {
+  margin-top: 6px;
+  background: var(--bg-alt);
+  border-radius: 6px;
+  overflow: hidden;
+}
+details.tool-output > summary {
+  list-style: none;
+  padding: 4px 8px; font-size: 11px; color: var(--text-mute); cursor: pointer;
+}
+details.tool-output > summary::-webkit-details-marker { display: none; }
+details.tool-output > pre {
+  margin: 0; padding: 8px 10px;
+  background: var(--bg-alt);
+  font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  overflow: auto; max-height: 220px;
+  font-family: 'SF Mono','Cascadia Code',Consolas,monospace;
+}
+
+/* subtask 内容区 */
+.agent-msg-body .md-body.sub-result { font-size: 14px; margin: 0; padding: 0; }
+/* 防止空结果区占位 */
+.agent-msg-body .md-body.sub-result:empty { display: none; }
+
+/* 审查结果 */
+.review-box {
+  background: var(--bg-elev, #f7f7f8); border-radius: 10px; padding: 12px 14px;
+  margin: 8px 0; border-left: 3px solid #dc2626;
+}
+.review-score {
+  font-size: 18px; font-weight: 700; color: #16a34a;
+}
+.review-score.low { color: #dc2626; }
+
+/* 任务树面板 */
+.task-panel {
+  position: fixed; right: 16px; bottom: 16px;
+  width: 280px; max-height: 400px; overflow-y: auto;
+  background: var(--bg, #fff); border: 1px solid var(--border, #e5e5e8);
+  border-radius: 12px; box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,0.08));
+  z-index: 50; font-size: 13px;
+  display: none;
+}
+.task-panel.visible { display: block; }
+.task-panel-header {
+  padding: 10px 14px; font-weight: 600; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.task-panel-body { padding: 8px 14px; }
+.task-panel-item {
+  display: flex; align-items: flex-start; gap: 8px; padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.task-panel-item:last-child { border-bottom: none; }
+.task-panel-item .role-avatar { width: 22px; height: 22px; font-size: 11px; }
+.task-panel-item-info { flex: 1; min-width: 0; }
+.task-panel-item-title { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-panel-item-status { font-size: 11px; color: var(--text-mute); }
+.task-panel-item-status.done { color: var(--success); }
+.task-panel-item-status.running { color: var(--accent); }
+.task-panel-item-status.error { color: var(--error); }
+
+@media (prefers-color-scheme: dark) {
+  .agent-msg-body { background: var(--assistant-bubble, #1f1f25); }
+  .review-box, .orch-plan, .task-panel { background: var(--bg-elev, #17171c); }
+}
 </style>
 </head>
 <body>
@@ -1358,6 +1685,15 @@ body {
   <span id="statusText">就绪</span>
 </div>
 
+<!-- 多 Agent 任务面板 -->
+<div class="task-panel" id="taskPanel">
+  <div class="task-panel-header">
+    <span>子任务进度</span>
+    <span id="taskPanelCount"></span>
+  </div>
+  <div class="task-panel-body" id="taskPanelBody"></div>
+</div>
+
 <script>
 /* ================================
  * 状态
@@ -1368,6 +1704,11 @@ var sendBtn = document.getElementById('send');
 var statusToast = document.getElementById('statusToast');
 var statusDot = document.getElementById('statusDot');
 var statusText = document.getElementById('statusText');
+
+var taskPanel = document.getElementById('taskPanel');
+var taskPanelBody = document.getElementById('taskPanelBody');
+var taskPanelCount = document.getElementById('taskPanelCount');
+var subtaskMsgs = {};  // taskId → { headerEl, bodyEl, metaEl, steps: [] }
 var modelPill = document.getElementById('modelPill');
 var emptyState = document.getElementById('emptyState');
 var newChatBtn = document.getElementById('newChatBtn');
@@ -1597,24 +1938,156 @@ async function resumeSession(id) {
   currentSessionId = id;
   activeSessionLabel.textContent = (d.summary || id).slice(0, 30);
 
-  // 清空当前对话并回放（把历史渲染成气泡，用 user/assistant 对展示）
+  // 清空当前对话
   chat.innerHTML = '';
-  // 简单：清空空态提示
   if (emptyState) {
     chat.appendChild(emptyState);
     emptyState.style.display = 'none';
   }
-  // 简化：不重放历史到 UI（避免消息过多），用一个提示气泡
-  if (d.messageCount > 0) {
-    var m = createMessage('assistant');
-    var box = document.createElement('div');
-    box.style.padding = '10px 0';
-    box.style.fontSize = '13px';
-    box.style.color = 'var(--text-dim)';
-    box.textContent = '（已恢复会话：共 ' + d.messageCount + ' 条消息，历史上下文已自动带入）';
-    m.contentEl.appendChild(box);
+
+  // 回放历史消息 —— 按主流 AI 风格：一个 user 对应一个 assistant 气泡
+  // 分段：每遇到 user 消息开启新段，本段内所有 assistant+tool 聚合到同一个 assistant 气泡
+  // assistant 气泡主体 = 本段最后一条 assistant 的 content（最终答复）
+  // 过程详情折叠面板 = 本段内所有 assistant 的 thinking + tool_calls + tool_results
+  var msgs = d.messages || [];
+  var segments = [];  // [{user, assistants: [{content, toolCalls}], tools: [{toolCallId, content}]}]
+  var curSeg = null;
+
+  for (var i = 0; i < msgs.length; i++) {
+    var m = msgs[i];
+    if (m.role === 'user' && m.content) {
+      curSeg = { user: m.content, assistants: [], tools: [] };
+      segments.push(curSeg);
+    } else if (curSeg && m.role === 'assistant') {
+      curSeg.assistants.push({ content: m.content || '', toolCalls: m.toolCalls || [] });
+    } else if (curSeg && m.role === 'tool') {
+      curSeg.tools.push({ toolCallId: m.toolCallId, content: m.content || '' });
+    }
   }
-  showEmpty();
+
+  var rendered = 0;
+  for (var s = 0; s < segments.length; s++) {
+    var seg = segments[s];
+
+    // --- user 气泡 ---
+    var um = createMessage('user');
+    um.contentEl.innerHTML = '<div class="md-body">' + renderMd(seg.user) + '</div>';
+    rendered++;
+
+    // --- assistant 气泡（聚合本段所有 assistant 消息） ---
+    var finalContent = '';
+    for (var ai = seg.assistants.length - 1; ai >= 0; ai--) {
+      if (seg.assistants[ai].content && seg.assistants[ai].content.trim()) {
+        finalContent = seg.assistants[ai].content;
+        break;
+      }
+    }
+
+    // 统计工具调用总数（用于折叠面板计数）
+    var totalToolCalls = 0;
+    for (var ai = 0; ai < seg.assistants.length; ai++) {
+      totalToolCalls += seg.assistants[ai].toolCalls.length;
+    }
+
+    // 跳过没有 assistant 内容且没有任何工具调用的空段
+    if (!finalContent && totalToolCalls === 0) continue;
+
+    var am = createMessage('assistant');
+    // 主体：最终答复内容
+    if (finalContent) {
+      am.contentEl.innerHTML = '<div class="md-body">' + renderMd(finalContent) + '</div>';
+    }
+
+    // 过程详情折叠面板：聚合所有 assistant 的 thinking + tool_calls + tool_results
+    if (seg.assistants.length > 1 || totalToolCalls > 0) {
+      var pendingSteps = {};  // toolCallId → step DOM
+      var allSteps = [];
+
+      for (var ai = 0; ai < seg.assistants.length; ai++) {
+        var ass = seg.assistants[ai];
+        // thinking（非最终答复的 assistant content 视为中间思考）
+        var isFinal = (ass.content === finalContent) && finalContent;
+        if (ass.content && ass.content.trim() && !isFinal) {
+          var thinkStep = document.createElement('div');
+          thinkStep.className = 'step think';
+          thinkStep.innerHTML =
+            '<span class="step-icon">🧠</span>' +
+            '<div class="step-body">' +
+              '<div class="md-body md-body-sm">' + renderMd(ass.content) + '</div>' +
+            '</div>';
+          allSteps.push(thinkStep);
+        }
+        // tool_calls + tool_results
+        for (var ti = 0; ti < ass.toolCalls.length; ti++) {
+          var tc = ass.toolCalls[ti];
+          var toolStep = document.createElement('div');
+          toolStep.className = 'step tool pending';
+          var tcId = tc.id || '';
+          toolStep.innerHTML =
+            '<span class="step-icon tool-icon">🔧</span>' +
+            '<div class="step-body">' +
+              '<div class="step-title"><span class="tool-name">' + esc(tc.function?.name || 'unknown') + '</span></div>' +
+            '</div>';
+          allSteps.push(toolStep);
+          if (tcId) pendingSteps[tcId] = toolStep;
+        }
+      }
+
+      // 回填工具结果
+      for (var ti = 0; ti < seg.tools.length; ti++) {
+        var tr = seg.tools[ti];
+        var stepEl = pendingSteps[tr.toolCallId];
+        if (stepEl) {
+          stepEl.className = 'step tool ok';
+          var outBox = document.createElement('div');
+          outBox.className = 'step-output';
+          if (tr.content) {
+            var outDet = document.createElement('details');
+            outDet.className = 'tool-output';
+            outDet.innerHTML = '<summary>查看输出</summary><pre class="tool-output-text">' + esc(tr.content.slice(0, 5000)) + '</pre>';
+            outBox.appendChild(outDet);
+          }
+          stepEl.querySelector('.step-body').appendChild(outBox);
+          delete pendingSteps[tr.toolCallId];
+        }
+      }
+
+      // 构建过程详情折叠面板（默认折叠 —— 符合主流 AI 样式）
+      if (allSteps.length > 0) {
+        var processWrap = document.createElement('details');
+        processWrap.className = 'process-details';
+        processWrap.innerHTML =
+          '<summary>' +
+            '<span>🔧 过程详情 · ' + seg.assistants.length + ' 轮思考 · ' + totalToolCalls + ' 次工具调用</span>' +
+            '<span class="chevron">▸</span>' +
+          '</summary>';
+        var processBody = document.createElement('div');
+        processBody.className = 'process-body';
+        for (var k = 0; k < allSteps.length; k++) processBody.appendChild(allSteps[k]);
+        processWrap.appendChild(processBody);
+        am.content.appendChild(processWrap);
+      }
+    }
+
+    rendered++;
+  }
+
+  // 如果没有渲染任何消息，显示空态
+  if (rendered === 0) {
+    showEmpty();
+  }
+
+  // 底部加一条恢复提示（半透明、小字体、居中分隔线）
+  if (d.messageCount > 0) {
+    var hint = createMessage('assistant');
+    hint.wrap.style.opacity = '0.6';
+    var hintBox = document.createElement('div');
+    hintBox.style.cssText = 'padding:6px 0;font-size:12px;color:var(--text-mute);text-align:center;';
+    hintBox.textContent = '—— 已恢复会话（共 ' + segments.length + ' 轮对话） ——';
+    hint.contentEl.appendChild(hintBox);
+  }
+
+  scrollBottom();
   await loadSessions();
   setStatus('已恢复会话', 'done');
 }
@@ -1761,6 +2234,38 @@ function buildProcessDetails(steps, toolCount) {
   return wrap;
 }
 
+function createAgentMessage(avatar, roleName, subtitle) {
+  var wrap = document.createElement('div');
+  wrap.className = 'agent-msg';
+
+  var av = document.createElement('div');
+  av.className = 'role-avatar role-' + (avatar || 'P');
+  av.textContent = avatar || 'P';
+  wrap.appendChild(av);
+
+  var content = document.createElement('div');
+  content.className = 'agent-msg-content';
+
+  var header = document.createElement('div');
+  header.className = 'agent-msg-header';
+  header.innerHTML = '<span class="agent-msg-name">' + esc(roleName || 'Agent') + '</span>' +
+    '<span class="agent-msg-status">' + esc(subtitle || '') + '</span>';
+  content.appendChild(header);
+
+  var body = document.createElement('div');
+  body.className = 'agent-msg-body';
+  content.appendChild(body);
+
+  var meta = document.createElement('div');
+  meta.className = 'agent-msg-meta';
+  content.appendChild(meta);
+
+  wrap.appendChild(content);
+  chat.appendChild(wrap);
+
+  return { wrap: wrap, headerEl: header, bodyEl: body, metaEl: meta };
+}
+
 function render(ev) {
   switch (ev.type) {
     case 'start':
@@ -1770,6 +2275,254 @@ function render(ev) {
         activeSessionLabel.textContent = ev.sessionId.slice(-17);
       }
       break;
+
+    /* ====== 多 Agent 协作事件 ====== */
+    case 'orchestrator_mode': {
+      // 隐藏思考中指示器，多 Agent 消息将直接附加到聊天
+      if (currentRun.runningMsg && currentRun.runningMsg.wrap) {
+        currentRun.runningMsg.wrap.style.display = 'none';
+        currentRun.runningMsg._hidden = true;
+      }
+      var banner = document.createElement('div');
+      banner.className = 'orch-banner';
+      banner.textContent = ev.message || '多 Agent 协作模式';
+      chat.appendChild(banner);
+      scrollBottom();
+      break;
+    }
+    case 'plan': {
+      taskPanel.classList.add('visible');
+      taskPanelBody.innerHTML = '';
+      subtaskMsgs = {};
+      var planBox = document.createElement('div');
+      planBox.className = 'orch-plan';
+      var planTitle = document.createElement('div');
+      planTitle.className = 'orch-plan-title';
+      planTitle.textContent = '任务分解 · 共 ' + ev.subtasks.length + ' 个子任务';
+      planBox.appendChild(planTitle);
+      var planList = document.createElement('div');
+      planList.className = 'orch-plan-list';
+      ev.subtasks.forEach(function(t) {
+        var item = document.createElement('div');
+        item.className = 'orch-plan-item';
+        item.innerHTML = '<span class="orch-plan-id">#' + t.id + '</span>' +
+          '<span class="orch-plan-role">' + esc(t.role) + '</span>' +
+          '<span class="orch-plan-title-text">' + esc(t.title) + '</span>' +
+          (t.dependsOn && t.dependsOn.length > 0 ? '<span class="orch-plan-dep">依赖 #' + t.dependsOn.join(',#') + '</span>' : '');
+        planList.appendChild(item);
+        // 任务面板项
+        var panelItem = document.createElement('div');
+        panelItem.className = 'task-panel-item';
+        panelItem.id = 'task-item-' + t.id;
+        panelItem.innerHTML = '<div class="role-avatar role-' + (t.role === 'coder' ? 'C' : t.role === 'researcher' ? 'R' : t.role === 'architect' ? 'A' : 'P') + '">' + (t.role === 'coder' ? 'C' : t.role === 'researcher' ? 'R' : t.role === 'architect' ? 'A' : 'P') + '</div>' +
+          '<div class="task-panel-item-info"><div class="task-panel-item-title">' + esc(t.title) + '</div>' +
+          '<div class="task-panel-item-status running">排队中</div></div>';
+        taskPanelBody.appendChild(panelItem);
+      });
+      planBox.appendChild(planList);
+      chat.appendChild(planBox);
+      taskPanelCount.textContent = '0/' + ev.subtasks.length;
+      scrollBottom();
+      break;
+    }
+    case 'subtask_start': {
+      var msg = createAgentMessage(ev.roleAvatar, ev.role, ev.title);
+      msg.headerEl.querySelector('.agent-msg-status').textContent = '执行中...';
+      // 为每个 subtask 创建统一的 md-body 内容容器与工具折叠面板
+      var subContentEl = document.createElement('div');
+      subContentEl.className = 'md-body sub-result';
+      var subToolCollapse = document.createElement('details');
+      subToolCollapse.className = 'process-details';
+      var subToolSummary = document.createElement('summary');
+      subToolSummary.innerHTML = '<span>🔧 过程详情 <em class="sub-tool-count">(0)</em></span><span class="chevron">▸</span>';
+      var subToolBox = document.createElement('div');
+      subToolBox.className = 'process-body';
+      subToolCollapse.appendChild(subToolSummary);
+      subToolCollapse.appendChild(subToolBox);
+      msg.bodyEl.appendChild(subContentEl);
+      msg.bodyEl.appendChild(subToolCollapse);
+      // 初始隐藏工具折叠面板（无工具时不占空间）
+      subToolCollapse.style.display = 'none';
+      subtaskMsgs[ev.taskId] = {
+        root: msg.root, headerEl: msg.headerEl, bodyEl: msg.bodyEl, metaEl: msg.metaEl,
+        contentEl: subContentEl, toolCollapseEl: subToolCollapse,
+        toolSummaryEl: subToolSummary, toolBoxEl: subToolBox,
+        toolCount: 0,
+      };
+      // 更新任务面板
+      var panelItem = document.getElementById('task-item-' + ev.taskId);
+      if (panelItem) panelItem.querySelector('.task-panel-item-status').textContent = '执行中';
+      scrollBottom();
+      break;
+    }
+    case 'subtask_assistant': {
+      var m = subtaskMsgs[ev.taskId];
+      if (m) {
+        if (ev.content && ev.content.trim().length > 0) {
+          // 思考内容 → 折叠到过程详情（视为 thinking）
+          var thinkEl = document.createElement('div');
+          thinkEl.className = 'step think';
+          thinkEl.innerHTML = '<span class="step-icon">🧠</span><div class="step-body md-body">' + renderMd(ev.content) + '</div>';
+          m.toolBoxEl.appendChild(thinkEl);
+          m.toolCount++;
+          m.toolCollapseEl.style.display = '';
+          m.toolSummaryEl.querySelector('.sub-tool-count').textContent = '(' + m.toolCount + ')';
+        }
+        if (ev.toolCalls && ev.toolCalls.length > 0) {
+          ev.toolCalls.forEach(function(tc) {
+            var toolEl = document.createElement('div');
+            toolEl.className = 'step tool pending';
+            toolEl.dataset.tcId = tc.id || '';
+            toolEl.innerHTML =
+              '<span class="step-icon tool-icon">🔧</span>' +
+              '<div class="step-body">' +
+                '<div class="step-title">' +
+                  '<span class="tool-name">' + esc(tc.name) + '</span>' +
+                  '<span class="tool-status pending">进行中...</span>' +
+                '</div>' +
+              '</div>';
+            m.toolBoxEl.appendChild(toolEl);
+            m.toolCount++;
+            m.toolCollapseEl.style.display = '';
+            m.toolSummaryEl.querySelector('.sub-tool-count').textContent = '(' + m.toolCount + ')';
+          });
+        }
+      }
+      scrollBottom();
+      break;
+    }
+    case 'subtask_tool_call': {
+      var m = subtaskMsgs[ev.taskId];
+      if (m) {
+        var toolEl = document.createElement('div');
+        toolEl.className = 'step tool pending';
+        toolEl.dataset.tcId = ev.id || '';
+        toolEl.innerHTML =
+          '<span class="step-icon tool-icon">🔧</span>' +
+          '<div class="step-body">' +
+            '<div class="step-title">' +
+              '<span class="tool-name">' + esc(ev.name) + '</span>' +
+              '<span class="tool-status pending">进行中...</span>' +
+            '</div>' +
+          '</div>';
+        m.toolBoxEl.appendChild(toolEl);
+        m.toolCount++;
+        m.toolCollapseEl.style.display = '';
+        m.toolSummaryEl.querySelector('.sub-tool-count').textContent = '(' + m.toolCount + ')';
+      }
+      break;
+    }
+    case 'subtask_tool_result': {
+      var m = subtaskMsgs[ev.taskId];
+      if (m) {
+        // 尝试根据 id 或逆序第一个 pending 匹配
+        var match = null;
+        if (ev.id) {
+          match = m.toolBoxEl.querySelector('.step.tool.pending[data-tc-id="' + ev.id + '"]');
+        }
+        if (!match) {
+          var pendingList = m.toolBoxEl.querySelectorAll('.step.tool.pending');
+          if (pendingList.length > 0) match = pendingList[pendingList.length - 1];
+        }
+        if (match) {
+          match.classList.remove('pending');
+          match.classList.add(ev.ok ? 'ok' : 'fail');
+          var statusEl = match.querySelector('.tool-status');
+          statusEl.className = 'tool-status ' + (ev.ok ? 'ok' : 'fail');
+          statusEl.textContent = ev.ok ? '成功 ' + ((ev.output || '').length) + ' chars' : '失败';
+          var outputText = ev.ok ? (ev.output || '') : (ev.error || '工具执行异常');
+          if (outputText.length > 2000) outputText = outputText.slice(0, 2000) + '\n...(已截断,共 ' + (ev.output ? ev.output.length : 0) + ' 字)';
+          var outEl = document.createElement('details');
+          outEl.className = 'tool-output';
+          var openState = !ev.ok ? 'open' : '';
+          outEl.innerHTML =
+            '<summary>查看输出</summary>' +
+            '<pre>' + esc(outputText) + '</pre>';
+          if (!ev.ok) outEl.open = true;
+          match.querySelector('.step-body').appendChild(outEl);
+        } else {
+          // 兜底：直接追加
+          var fallbackEl = document.createElement('div');
+          fallbackEl.className = 'step tool ' + (ev.ok ? 'ok' : 'fail');
+          var fallbackText = (ev.ok ? ev.output : ev.error) || '';
+          if (fallbackText.length > 2000) fallbackText = fallbackText.slice(0, 2000) + '\n...(已截断)';
+          fallbackEl.innerHTML =
+            '<span class="step-icon tool-icon">🔧</span>' +
+            '<div class="step-body">' +
+              '<div class="step-title">' +
+                '<span class="tool-name">' + esc(ev.name) + '</span>' +
+                '<span class="tool-status ' + (ev.ok ? 'ok' : 'fail') + '">' + (ev.ok ? '成功' : '失败') + '</span>' +
+              '</div>' +
+              '<pre style="margin:4px 0;padding:8px;background:var(--bg-alt);border-radius:6px;font-size:12px;overflow:auto;max-height:200px;">' + esc(fallbackText) + '</pre>' +
+            '</div>';
+          m.toolBoxEl.appendChild(fallbackEl);
+          m.toolCount++;
+          m.toolCollapseEl.style.display = '';
+          m.toolSummaryEl.querySelector('.sub-tool-count').textContent = '(' + m.toolCount + ')';
+        }
+      }
+      break;
+    }
+    case 'subtask_done': {
+      var m = subtaskMsgs[ev.taskId];
+      if (m) {
+        m.headerEl.querySelector('.agent-msg-status').textContent = '✅ ' + (ev.status === 'completed' ? '完成' : ev.status);
+        // 最终结果渲染到内容区（md-body），保证 markdown 正常
+        if (ev.answer && ev.answer.trim().length > 0) {
+          m.contentEl.innerHTML = renderMd(ev.answer);
+        }
+        // 如果没有任何工具调用也没有回答内容，工具面板隐藏即可
+        if (m.toolCount === 0) {
+          m.toolCollapseEl.style.display = 'none';
+        }
+        m.metaEl.textContent = '耗时: ' + (ev.elapsedMs / 1000).toFixed(1) + 's';
+      }
+      // 更新任务面板
+      var panelItem = document.getElementById('task-item-' + ev.taskId);
+      if (panelItem) {
+        var status = panelItem.querySelector('.task-panel-item-status');
+        status.textContent = '✅ 完成';
+        status.className = 'task-panel-item-status done';
+      }
+      // 更新计数
+      var done = taskPanelBody.querySelectorAll('.task-panel-item-status.done').length;
+      var total = taskPanelBody.querySelectorAll('.task-panel-item').length;
+      taskPanelCount.textContent = done + '/' + total;
+      scrollBottom();
+      break;
+    }
+    case 'review': {
+      var rBox = document.createElement('div');
+      rBox.className = 'review-box';
+      var scoreClass = ev.score >= 60 ? '' : ' low';
+      rBox.innerHTML = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">' +
+        '<div class="role-avatar role-V">V</div>' +
+        '<span class="agent-msg-name">审查员</span>' +
+        '<span class="review-score' + scoreClass + '">' + ev.score + '/100</span>' +
+        '<span style="font-size:12px;color:var(--text-mute)">(' + (ev.passed ? '通过' : '需修正') + ')</span>' +
+      '</div>';
+      var reviewBody = document.createElement('div');
+      reviewBody.className = 'md-body';
+      reviewBody.innerHTML = renderMd(ev.review || '');
+      rBox.appendChild(reviewBody);
+      chat.appendChild(rBox);
+      scrollBottom();
+      break;
+    }
+    case 'summary': {
+      // Orchestrator 的最终汇总会在 done 事件里渲染，这里只更新状态
+      setStatus('汇总完成 ' + (ev.elapsedMs / 1000).toFixed(1) + 's', 'done');
+      break;
+    }
+    case 'orchestrator_error': {
+      var eBox = document.createElement('div');
+      eBox.style.cssText = 'background:rgba(220,38,38,0.12);color:var(--error);padding:12px 16px;border-radius:12px;font-size:14px;';
+      eBox.textContent = '编排错误: ' + ev.error;
+      chat.appendChild(eBox);
+      scrollBottom();
+      break;
+    }
+
     case 'assistant':
       if (ev.content) currentRun.steps.push({ type: 'think', text: ev.content });
       break;
@@ -1795,7 +2548,23 @@ function render(ev) {
     case 'done': {
       running = false;
       setStatus('完成', 'done');
-      if (currentRun.runningMsg) {
+
+      // 多 Agent 模式：thinking 消息被隐藏了，创建新的汇总消息
+      if (currentRun.runningMsg && currentRun.runningMsg._hidden) {
+        var summaryMsg = createMessage('assistant');
+        summaryMsg.contentEl.innerHTML = '';
+        var sMeta = document.createElement('div');
+        sMeta.className = 'run-meta';
+        if (ev.elapsedMs != null)
+          sMeta.innerHTML += '<span class="run-meta-item"><span class="run-meta-icon">⏱</span>' + esc(formatMs(ev.elapsedMs)) + '</span>';
+        if (ev.rounds != null)
+          sMeta.innerHTML += '<span class="run-meta-item"><span class="run-meta-icon">⟳</span>' + esc(ev.rounds) + ' 子任务</span>';
+        summaryMsg.contentEl.appendChild(sMeta);
+        var sAnswer = document.createElement('div');
+        sAnswer.className = 'md-body';
+        sAnswer.innerHTML = renderMd(ev.answer || '(无内容)');
+        summaryMsg.contentEl.appendChild(sAnswer);
+      } else if (currentRun.runningMsg) {
         var msg = currentRun.runningMsg;
         msg.contentEl.innerHTML = '';
         var meta = document.createElement('div');
@@ -1818,12 +2587,14 @@ function render(ev) {
         var details = buildProcessDetails(currentRun.steps, currentRun.toolCount);
         if (details) msg.contentEl.appendChild(details);
       }
+      // 隐藏任务面板（延迟 3 秒后隐藏）
+      setTimeout(function() { taskPanel.classList.remove('visible'); }, 3000);
       currentRun = { steps: [], runningMsg: null, toolCount: 0 };
       sendBtn.disabled = false;
       inputEl.focus();
       scrollBottom();
-      loadSessions();  // 刷新会话列表（新建/更新了）
-      loadMemory();    // 模型可能调用 memory(save) 新增了偏好
+      loadSessions();
+      loadMemory();
       break;
     }
     case 'error': {

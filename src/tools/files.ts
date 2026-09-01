@@ -151,6 +151,91 @@ export const runCommandTool: Tool = defineTool({
   },
 });
 
+export const editFileTool: Tool = defineTool({
+  name: 'edit_file',
+  description:
+    '对工作区内已有文件做增量补丁替换。传入 old_string（文件中必须精确存在的片段）和 new_string（替换后的内容）。如果 old_string 在文件中找不到或不唯一，会返回错误提示。比 write_file 更安全——只改局部，不会覆盖整个文件。',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '文件路径（相对于工作区根目录）。' },
+      old_string: { type: 'string', description: '要被替换的原始文本片段（必须与文件内容精确匹配，包括缩进和换行）。' },
+      new_string: { type: 'string', description: '替换后的新文本片段。' },
+    },
+    required: ['path', 'old_string', 'new_string'],
+    additionalProperties: false,
+  },
+  requiresApproval: true,
+  async execute(args, ctx) {
+    const target = resolveInWorkspace(ctx.cwd, String(args.path));
+    const oldStr = String(args.old_string);
+    const newStr = String(args.new_string);
+
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat || !stat.isFile()) {
+      return errorResult(`文件不存在或不可读: ${target}`);
+    }
+
+    const content = await fs.readFile(target, 'utf8');
+
+    // 检查 old_string 是否存在
+    const occurrences = content.split(oldStr).length - 1;
+    if (occurrences === 0) {
+      // 提供上下文提示帮助模型修正
+      const lines = content.split('\n');
+      return errorResult(
+        `old_string 在文件中未找到。文件共 ${lines.length} 行。请先用 read_file 查看文件内容，确保 old_string 精确匹配（包括缩进和换行）。`,
+      );
+    }
+    if (occurrences > 1) {
+      return errorResult(
+        `old_string 在文件中出现了 ${occurrences} 次，无法唯一定位。请提供更长、更精确的 old_string 上下文以唯一匹配。`,
+      );
+    }
+
+    const newContent = content.replace(oldStr, newStr);
+    await fs.writeFile(target, newContent, 'utf8');
+    return {
+      ok: true,
+      output: `已替换 ${target} 中的 ${oldStr.length} 字符 → ${newStr.length} 字符（文件总计 ${newContent.length} 字符）`,
+    };
+  },
+});
+
+export const readFilePagedTool: Tool = defineTool({
+  name: 'read_file_paged',
+  description:
+    '分页读取大文件。支持 start_line 和 end_line 参数按行号读取指定范围，适合大文件分段查看。',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '文件路径（相对于工作区根目录）。' },
+      start_line: { type: 'integer', description: '起始行号（从 1 开始，默认 1）。' },
+      end_line: { type: 'integer', description: '结束行号（默认到文件末尾）。' },
+    },
+    required: ['path'],
+    additionalProperties: false,
+  },
+  requiresApproval: false,
+  async execute(args, ctx) {
+    const target = resolveInWorkspace(ctx.cwd, String(args.path));
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat || !stat.isFile()) {
+      return errorResult(`不是可读文件: ${target}`);
+    }
+    const raw = await fs.readFile(target, 'utf8');
+    const lines = raw.split('\n');
+    const start = Math.max(1, Number(args.start_line ?? 1));
+    const end = Math.min(lines.length, Number(args.end_line ?? lines.length));
+    const sliced = lines.slice(start - 1, end);
+    const numbered = sliced.map((line, i) => `${start + i}→${line}`).join('\n');
+    return {
+      ok: true,
+      output: `文件 ${args.path}（共 ${lines.length} 行，显示 ${start}-${end}）:\n${numbered}`,
+    };
+  },
+});
+
 function errorResult(error: string): ToolResult {
   return { ok: false, output: '', error };
 }

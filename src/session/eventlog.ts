@@ -92,12 +92,23 @@ export class EventLog {
           messages.push({ role: 'user', content: String(ev.payload.content ?? '') });
           break;
         case 'assistant_message': {
-          const content = ev.payload.content ? String(ev.payload.content) : null;
-          const calls = Array.isArray(ev.payload.tool_calls) ? (ev.payload.tool_calls as ChatMessage['tool_calls']) : undefined;
+          // content: 空字符串也保留（区别于 null），避免丢失 "模型返回了空内容" 的语义
+          const rawContent = ev.payload.content;
+          const content = rawContent != null ? String(rawContent) : null;
+          // tool_calls: 存储时是扁平结构 {id, name, arguments}，回放时转为标准嵌套结构
+          const rawCalls = Array.isArray(ev.payload.tool_calls) ? ev.payload.tool_calls : [];
+          const calls: ChatMessage['tool_calls'] = rawCalls.map((tc: Record<string, unknown>) => ({
+            id: String(tc.id ?? ''),
+            type: 'function' as const,
+            function: {
+              name: String(tc.name ?? (tc.function as Record<string, unknown> | undefined)?.name ?? ''),
+              arguments: String(tc.arguments ?? (tc.function as Record<string, unknown> | undefined)?.arguments ?? ''),
+            },
+          }));
           messages.push({
             role: 'assistant',
             content,
-            tool_calls: calls && calls.length > 0 ? calls : undefined,
+            tool_calls: calls.length > 0 ? calls : undefined,
           });
           break;
         }

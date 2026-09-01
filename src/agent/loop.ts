@@ -10,10 +10,15 @@ export interface AgentLoopDeps {
   maxRounds?: number;
   maxRetries?: number;
   commandTimeoutMs?: number;
-  contextTokenBudget?: number; // 模型上下文窗口 token 上限（默认 128000）
+  contextTokenBudget?: number;
   signal?: AbortSignal;
-  /** 长期偏好事实（已格式化的 prompt 文本），会拼进 system message */
   longTermFacts?: string;
+  /** 角色化：角色专属 prompt 前缀（拼在通用 system message 之前） */
+  systemPromptPrefix?: string;
+  /** 角色化：角色名称（供 UI 标记来源） */
+  roleName?: string;
+  /** 角色化：角色头像标识（供 UI 显示） */
+  roleAvatar?: string;
   onToolCall?: (call: ToolCall) => void;
   onAssistantMessage?: (message: ChatMessage) => void;
   onToolResult?: (call: ToolCall, result: { ok: boolean; output: string; error?: string }) => void;
@@ -36,7 +41,7 @@ export async function runAgentTask(
   const maxRounds = deps.maxRounds ?? 12;
   // 每次都用最新 system message（保证长期事实是最新的），
   // 即使 history 里有旧 system，也替换掉（消息里的 system role 只允许一个存在于入模序列）。
-  const freshSystem = buildSystemMessage(deps.cwd, deps.longTermFacts);
+  const freshSystem = buildSystemMessage(deps.cwd, deps.longTermFacts, deps.systemPromptPrefix);
   const historyWithoutOldSystem =
     history && history.length > 0
       ? history.filter((m) => m.role !== 'system')
