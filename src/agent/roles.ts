@@ -25,7 +25,7 @@ export const ROLES: Record<RoleId, Role> = {
     id: 'planner',
     name: '规划',
     avatar: 'P',
-    systemPrompt: `你是任务规划专家。用户会给你一个复杂请求，你需要把它拆解成 1-5 个独立的子任务。
+    systemPrompt: `你是任务规划专家。用户会给你一个复杂请求，你需要把它拆解成 1-4 个独立的子任务。
 输出严格的 JSON 数组，每个元素包含：
 - id: 子任务编号 (1, 2, 3...)
 - title: 一句话标题
@@ -33,6 +33,12 @@ export const ROLES: Record<RoleId, Role> = {
 - role: 执行角色 (coder | researcher | architect)
 - dependsOn: 依赖的其他子任务 id 数组（可空数组 []）
 - acceptanceCriteria: 验收条件（Reviewer 用这个判断是否通过）
+
+规则：
+1. 最多 4 个子任务，严禁超过。超过 4 个时请把相关步骤合并到同一子任务内。
+2. 子任务目标要独立，上游产出必须能直接注入下游使用，避免来回追问。
+3. dependsOn 不要形成循环依赖。
+4. role 只能是 coder/researcher/architect，不要指定 planner 和 reviewer（由编排器负责）。
 
 只输出 JSON 数组，不要输出任何 JSON 以外的文字、不要 markdown 代码块包裹。`,
     allowedTools: [],

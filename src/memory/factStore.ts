@@ -8,7 +8,7 @@ export interface Fact {
   category?: 'preference' | string;
 }
 
-/** 长期事实库：JSON Lines 存储，一条一行 = 一个持久化的用户偏好事实。
+/** 长期事实库：JSON Lines 存储一个持久化的用户偏好事实。
  *
  * 仅保存 "用户偏好" 类事实（用户明确要求的习惯、约束、偏好，不是会话内容）。
  * 例如："习惯用中文回答"、"输出要简洁"、"不要写 Python 脚本，优先用内置工具"。

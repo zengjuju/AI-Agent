@@ -135,7 +135,7 @@ export async function loadConfig(args: CliArgs): Promise<AppConfig> {
     apiBase: args.apiBase ?? envApiBase ?? fileConfig.apiBase ?? baseDefault,
     apiKey,
     cwd,
-    maxRounds: toPositiveInt(args.maxRounds ?? process.env.FORGE_MAX_ROUNDS ?? fileConfig.maxRounds, 12),
+    maxRounds: toPositiveInt(args.maxRounds ?? process.env.FORGE_MAX_ROUNDS ?? fileConfig.maxRounds, 30),
     maxRetries: toPositiveInt(args.maxRetries ?? process.env.FORGE_MAX_RETRIES ?? fileConfig.maxRetries, 2),
     commandTimeoutMs: toPositiveInt(
       args.commandTimeoutMs ?? process.env.FORGE_COMMAND_TIMEOUT_MS ?? fileConfig.commandTimeoutMs,

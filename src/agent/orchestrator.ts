@@ -195,7 +195,8 @@ export class Orchestrator {
           role: String(item.role ?? 'coder') as 'coder' | 'researcher' | 'architect',
           dependsOn: Array.isArray(item.dependsOn) ? item.dependsOn.map(Number) : [],
           acceptanceCriteria: String(item.acceptanceCriteria ?? '完成描述中的任务'),
-        }));
+        }))
+        .slice(0, 4);
     } catch {
       return [];
     }
@@ -290,7 +291,7 @@ export class Orchestrator {
         provider: this.deps.provider,
         tools: roleTools,
         cwd: this.deps.cwd,
-        maxRounds: 8,
+        maxRounds: 16,
         maxRetries: this.deps.maxRetries,
         commandTimeoutMs: this.deps.commandTimeoutMs,
         contextTokenBudget: this.deps.contextTokenBudget,
@@ -458,7 +459,7 @@ export class Orchestrator {
           provider: this.deps.provider,
           tools: roleTools,
           cwd: this.deps.cwd,
-          maxRounds: 6,
+          maxRounds: 10,
           maxRetries: this.deps.maxRetries,
           commandTimeoutMs: this.deps.commandTimeoutMs,
           contextTokenBudget: this.deps.contextTokenBudget,
